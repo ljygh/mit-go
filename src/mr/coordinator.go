@@ -1,7 +1,7 @@
 package mr
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -41,7 +41,7 @@ var cSock string = coordinatorSock()
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// set log
 	// log.SetOutput(os.Stdout)
-	log.SetOutput(ioutil.Discard)
+	log.SetOutput(io.Discard)
 	// outFile, _ := os.Open("../coordinator.log")
 	// log.SetOutput(outFile)
 

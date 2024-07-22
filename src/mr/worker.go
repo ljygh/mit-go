@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
@@ -13,9 +13,7 @@ import (
 	"time"
 )
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
@@ -33,12 +31,10 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 var directory string = ""
 
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	// log.SetOutput(os.Stdout)
-	log.SetOutput(ioutil.Discard)
+	log.SetOutput(io.Discard)
 	log.SetFlags(log.Lshortfile)
 	log.Print("Worker starts")
 	for {
@@ -75,7 +71,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		noticeArgs.Files = noticeFiles
 		var reply bool
 		noticeCall(&noticeArgs, &reply)
-		if task.TaskType == 1 && reply == true {
+		if task.TaskType == 1 && reply {
 			for _, file := range task.Files {
 				os.Remove(directory + file)
 			}
@@ -86,11 +82,9 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func taskCall(reply *Task) int {
 	// c, err := rpc.DialHTTP("tcp", coordinatorIP+coordinatorPort)
 	c, err := rpc.DialHTTP("unix", cSock)
@@ -108,11 +102,9 @@ func taskCall(reply *Task) int {
 	return 2
 }
 
-//
 // send an RPC notice to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong or the coordinator response false.
-//
 func noticeCall(args *NoticeArgs, reply *bool) bool {
 	// c, err := rpc.DialHTTP("tcp", coordinatorIP+coordinatorPort)
 	c, err := rpc.DialHTTP("unix", cSock)
@@ -123,7 +115,7 @@ func noticeCall(args *NoticeArgs, reply *bool) bool {
 	defer c.Close()
 
 	err = c.Call("Coordinator.HandleNotice", args, reply)
-	if err == nil && *reply == true {
+	if err == nil && *reply {
 		return true
 	}
 	return false
@@ -140,7 +132,7 @@ func doMap(mapf func(string, string) []KeyValue, task Task) []string {
 	if err != nil {
 		log.Fatalf("cannot open %v", filepath)
 	}
-	content, err := ioutil.ReadAll(file)
+	content, err := io.ReadAll(file)
 	if err != nil {
 		log.Fatalf("cannot read %v", filepath)
 	}
@@ -243,10 +235,8 @@ func doReduce(reducef func(string, []string) string, task Task) {
 	ofile.Close()
 }
 
-//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
