@@ -19,8 +19,13 @@ package raft
 
 import (
 	//	"bytes"
+	"log"
+	"math/rand"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
@@ -47,6 +52,18 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// Define states of a raft server
+type State int
+
+const (
+	Follower State = iota
+	Candidate
+	Leader
+)
+
+// Define time interval for heart beat
+const heartbeatInterval float32 = 0.1
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -58,7 +75,10 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentTerm int
+	votedFor    int
+	timeout     float32
+	state       State
 }
 
 // return currentTerm and whether this server
@@ -241,7 +261,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	// Set log
+	file, err := os.OpenFile("log_"+strconv.Itoa(me)+".txt", os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatalf("Error opening file: %v", err)
+	}
+	defer file.Close()
+	log.SetOutput(file)
+	log.Println("Start raft server", me)
+	log.Println()
+
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.state = Follower
+
+	source := rand.NewSource(time.Now().UnixNano())
+	random := rand.New(source)
+	const min float32 = 0.4
+	const max float32 = 0.6
+	rf.timeout = min + random.Float32()*(max-min)
+	log.Println("Initialize states of the raft server")
+	log.Println("Timeout:", rf.timeout)
+	log.Println()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
