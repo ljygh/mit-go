@@ -78,7 +78,11 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	timeout     float32
+	timer       float32
 	state       State
+
+	// log
+	tickerLogger *log.Logger
 }
 
 // return currentTerm and whether this server
@@ -88,6 +92,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = (rf.state == Leader)
 	return term, isleader
 }
 
@@ -147,17 +153,27 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateID int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term    int
+	Success bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm || rf.votedFor == -1 {
+		reply.Success = false
+	} else {
+		reply.Success = true
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -189,6 +205,32 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+// Rpc args for AppendEntry
+type AppendEntryArgs struct {
+	Term     int
+	LeaderID int
+}
+
+// Rpc reply for AppendEntry
+type AppendEntryReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	} else {
+		reply.Success = true
+	}
+}
+
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
 	return ok
 }
 
@@ -236,12 +278,60 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	// Set ticker logger
+	file, err := os.OpenFile("ticker_log_"+strconv.Itoa(rf.me)+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	defer file.Close()
+	tickerLogger := log.New(file, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags)
+	tickerLogger.Println("Ticker of server", rf.me, "started")
+	tickerLogger.Println()
+
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
+		time.Sleep(time.Millisecond)
+		rf.timer += 0.001
+		if rf.state == Follower && rf.timer >= rf.timeout {
+			tickerLogger.Println("Raft server", rf.me, "follower timeout")
+			rf.state = Candidate
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.timer = 0.0
+			votes := 0
+			tickerLogger.Println("Request votes to all servers")
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me {
+					args := RequestVoteArgs{}
+					args.Term = rf.currentTerm
+					args.CandidateID = rf.me
+					reply := RequestVoteReply{}
+					rf.sendRequestVote(i, &args, &reply)
+					if reply.Success {
+						votes++
+					}
+				}
+			}
+			tickerLogger.Println("Get number of votes:", votes)
+			if votes > (len(rf.peers) / 2) {
+				rf.state = Leader
+			}
+		} else if rf.state == Follower {
+			continue
+		} else if rf.timer >= heartbeatInterval { // Leader
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me {
+					args := AppendEntryArgs{}
+					args.Term = rf.currentTerm
+					args.LeaderID = rf.me
+					reply := AppendEntryReply{}
+					rf.sendAppendEntry(i, &args, &reply)
+				}
+			}
+		}
 	}
 }
 
@@ -261,29 +351,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Set log
-	file, err := os.OpenFile("log_"+strconv.Itoa(me)+".txt", os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		log.Fatalf("Error opening file: %v", err)
-	}
-	defer file.Close()
-	log.SetOutput(file)
-	log.Println("Start raft server", me)
-	log.Println()
-
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.state = Follower
+	rf.timer = 0.0
 
 	source := rand.NewSource(time.Now().UnixNano())
 	random := rand.New(source)
 	const min float32 = 0.4
 	const max float32 = 0.6
 	rf.timeout = min + random.Float32()*(max-min)
-	log.Println("Initialize states of the raft server")
-	log.Println("Timeout:", rf.timeout)
-	log.Println()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
