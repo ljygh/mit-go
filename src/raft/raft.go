@@ -286,6 +286,7 @@ func (rf *Raft) ticker() {
 	defer file.Close()
 	tickerLogger := log.New(file, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags)
 	tickerLogger.Println("Ticker of server", rf.me, "started")
+	tickerLogger.Println("timeout:", rf.timeout)
 	tickerLogger.Println()
 
 	for !rf.killed() {
@@ -301,34 +302,51 @@ func (rf *Raft) ticker() {
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			rf.timer = 0.0
-			votes := 0
+
 			tickerLogger.Println("Request votes to all servers")
+			var wg sync.WaitGroup
+			votes := make(chan bool, len(rf.peers)-1)
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
-					args := RequestVoteArgs{}
-					args.Term = rf.currentTerm
-					args.CandidateID = rf.me
-					reply := RequestVoteReply{}
-					rf.sendRequestVote(i, &args, &reply)
-					if reply.Success {
-						votes++
-					}
+					wg.Add(1)
+					go func() {
+						args := RequestVoteArgs{}
+						args.Term = rf.currentTerm
+						args.CandidateID = rf.me
+						reply := RequestVoteReply{}
+						rf.sendRequestVote(i, &args, &reply)
+						votes <- reply.Success
+						wg.Done()
+					}()
 				}
 			}
-			tickerLogger.Println("Get number of votes:", votes)
-			if votes > (len(rf.peers) / 2) {
-				rf.state = Leader
+			wg.Wait()
+			close(votes)
+
+			votesCount := 0
+			for voteRes := range votes {
+				if voteRes {
+					votesCount++
+				}
 			}
-		} else if rf.state == Follower {
-			continue
-		} else if rf.timer >= heartbeatInterval { // Leader
+
+			tickerLogger.Println("Get number of votes:", votesCount)
+			if votesCount > (len(rf.peers) / 2) {
+				rf.state = Leader
+				tickerLogger.Println("Become leader")
+			}
+		} else if rf.state == Leader && rf.timer >= heartbeatInterval { // Leader
+			rf.timer = 0.0
+			tickerLogger.Println("Send heartbeat to servers")
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
-					args := AppendEntryArgs{}
-					args.Term = rf.currentTerm
-					args.LeaderID = rf.me
-					reply := AppendEntryReply{}
-					rf.sendAppendEntry(i, &args, &reply)
+					go func() {
+						args := AppendEntryArgs{}
+						args.Term = rf.currentTerm
+						args.LeaderID = rf.me
+						reply := AppendEntryReply{}
+						rf.sendAppendEntry(i, &args, &reply)
+					}()
 				}
 			}
 		}
