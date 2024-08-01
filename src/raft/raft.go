@@ -169,10 +169,13 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm || rf.votedFor == -1 {
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	} else if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
 		reply.Success = false
 	} else {
 		reply.Success = true
+		rf.votedFor = args.CandidateID
 	}
 }
 
@@ -226,6 +229,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = false
 	} else {
 		reply.Success = true
+		if rf.currentTerm < args.Term {
+			rf.timeout = newTimeout()
+		}
+		rf.currentTerm = args.Term
+		rf.timer = 0.0
 	}
 }
 
@@ -296,13 +304,15 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		time.Sleep(time.Millisecond)
 		rf.timer += 0.001
-		if rf.state == Follower && rf.timer >= rf.timeout {
+		if rf.state == Follower && rf.timer >= rf.timeout { // Follower timeout.
 			tickerLogger.Println("Raft server", rf.me, "follower timeout")
 			rf.state = Candidate
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			rf.timer = 0.0
+			rf.timeout = newTimeout()
 
+			// Request votes.
 			tickerLogger.Println("Request votes to all servers")
 			var wg sync.WaitGroup
 			votes := make(chan bool, len(rf.peers)-1)
@@ -323,6 +333,7 @@ func (rf *Raft) ticker() {
 			wg.Wait()
 			close(votes)
 
+			// Count votes.
 			votesCount := 0
 			for voteRes := range votes {
 				if voteRes {
@@ -330,14 +341,20 @@ func (rf *Raft) ticker() {
 				}
 			}
 
+			// Make decision based on result of votes.
 			tickerLogger.Println("Get number of votes:", votesCount)
 			if votesCount > (len(rf.peers) / 2) {
 				rf.state = Leader
 				tickerLogger.Println("Become leader")
+			} else {
+				rf.state = Follower
+				tickerLogger.Println("Lose election, convert back to follower")
 			}
 		} else if rf.state == Leader && rf.timer >= heartbeatInterval { // Leader
 			rf.timer = 0.0
 			tickerLogger.Println("Send heartbeat to servers")
+			ch := make(chan int)
+			defer close(ch)
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
 					go func() {
@@ -346,7 +363,19 @@ func (rf *Raft) ticker() {
 						args.LeaderID = rf.me
 						reply := AppendEntryReply{}
 						rf.sendAppendEntry(i, &args, &reply)
+						if !reply.Success {
+							rf.mu.Lock()
+							rf.currentTerm = reply.Term
+							rf.state = Follower
+							rf.timeout = newTimeout()
+							ch <- 1
+							rf.mu.Unlock()
+						}
 					}()
+				}
+				if len(ch) > 0 {
+					tickerLogger.Println("Obsolete leader, convert back to follower")
+					break
 				}
 			}
 		}
@@ -375,11 +404,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.timer = 0.0
 
-	source := rand.NewSource(time.Now().UnixNano())
-	random := rand.New(source)
-	const min float32 = 0.4
-	const max float32 = 0.6
-	rf.timeout = min + random.Float32()*(max-min)
+	rf.timeout = newTimeout()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -388,4 +413,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+// Generate a random timeout.
+func newTimeout() float32 {
+	source := rand.NewSource(time.Now().UnixNano())
+	random := rand.New(source)
+	const min float32 = 0.4
+	const max float32 = 0.6
+	return min + random.Float32()*(max-min)
 }
