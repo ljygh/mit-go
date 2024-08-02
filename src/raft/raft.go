@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"log"
 	"math/rand"
 	"os"
@@ -61,7 +62,7 @@ const (
 	Leader
 )
 
-// Define time interval for heart beat
+// Define time interval for heart beat.
 const heartbeatInterval float32 = 0.1
 
 // A Go object implementing a single Raft peer.
@@ -80,9 +81,6 @@ type Raft struct {
 	timeout     float32
 	timer       float32
 	state       State
-
-	// log
-	tickerLogger *log.Logger
 }
 
 // return currentTerm and whether this server
@@ -171,11 +169,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
-	} else if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
+	} else if args.Term == rf.currentTerm && rf.votedFor != -1 {
 		reply.Success = false
 	} else {
 		reply.Success = true
 		rf.votedFor = args.CandidateID
+		rf.currentTerm = args.Term
+		rf.timer = 0.0
+		rf.timeout = newTimeout()
 	}
 }
 
@@ -231,9 +232,12 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = true
 		if rf.currentTerm < args.Term {
 			rf.timeout = newTimeout()
+			rf.currentTerm = args.Term
 		}
-		rf.currentTerm = args.Term
 		rf.timer = 0.0
+		if rf.state == Leader {
+			rf.state = Follower
+		}
 	}
 }
 
@@ -302,49 +306,70 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		tickerLogger.Println("State:", rf.state, ", Term:", rf.currentTerm, ", VotedFor:", rf.votedFor, ", timer:", rf.timer)
 		time.Sleep(time.Millisecond)
 		rf.timer += 0.001
 		if rf.state == Follower && rf.timer >= rf.timeout { // Follower timeout.
 			tickerLogger.Println("Raft server", rf.me, "follower timeout")
-			rf.state = Candidate
 			rf.currentTerm++
 			rf.votedFor = rf.me
+			rf.state = Candidate
 			rf.timer = 0.0
 			rf.timeout = newTimeout()
 
 			// Request votes.
 			tickerLogger.Println("Request votes to all servers")
+			inTime := time.Now()
 			var wg sync.WaitGroup
-			votes := make(chan bool, len(rf.peers)-1)
+			var votes int = 1
+			var aliveServers int = 1
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
 					wg.Add(1)
-					go func() {
+					go func(votes *int, aliveServers *int) {
 						args := RequestVoteArgs{}
 						args.Term = rf.currentTerm
 						args.CandidateID = rf.me
 						reply := RequestVoteReply{}
-						rf.sendRequestVote(i, &args, &reply)
-						votes <- reply.Success
+						ok := rf.sendRequestVote(i, &args, &reply)
+						if ok {
+							*aliveServers++
+							if reply.Success {
+								*votes++
+							}
+						}
 						wg.Done()
-					}()
+					}(&votes, &aliveServers)
 				}
 			}
-			wg.Wait()
-			close(votes)
 
-			// Count votes.
-			votesCount := 0
-			for voteRes := range votes {
-				if voteRes {
-					votesCount++
+			done := make(chan bool)
+			go func() {
+				defer close(done)
+				wg.Wait()
+				done <- true
+			}()
+
+			voteSuccess := false
+			select {
+			case <-done:
+				if votes > (aliveServers / 2) {
+					voteSuccess = true
+				}
+			case <-time.After(100 * time.Millisecond):
+				if votes > (aliveServers / 2) {
+					voteSuccess = true
 				}
 			}
+			outTime := time.Now()
+			tickerLogger.Println("Time cost of requesting votes:", outTime.Sub(inTime))
 
 			// Make decision based on result of votes.
-			tickerLogger.Println("Get number of votes:", votesCount)
-			if votesCount > (len(rf.peers) / 2) {
+			tickerLogger.Println("Get number of votes:", votes)
+			tickerLogger.Println("Number of alive servers:", aliveServers)
+			if voteSuccess {
 				rf.state = Leader
+				rf.timer = 0.1
 				tickerLogger.Println("Become leader")
 			} else {
 				rf.state = Follower
@@ -353,10 +378,11 @@ func (rf *Raft) ticker() {
 		} else if rf.state == Leader && rf.timer >= heartbeatInterval { // Leader
 			rf.timer = 0.0
 			tickerLogger.Println("Send heartbeat to servers")
-			ch := make(chan int)
-			defer close(ch)
+			terms := make(chan int, len(rf.peers)-1)
+			var wg sync.WaitGroup
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
+					wg.Add(1)
 					go func() {
 						args := AppendEntryArgs{}
 						args.Term = rf.currentTerm
@@ -364,19 +390,27 @@ func (rf *Raft) ticker() {
 						reply := AppendEntryReply{}
 						rf.sendAppendEntry(i, &args, &reply)
 						if !reply.Success {
-							rf.mu.Lock()
-							rf.currentTerm = reply.Term
-							rf.state = Follower
-							rf.timeout = newTimeout()
-							ch <- 1
-							rf.mu.Unlock()
+							terms <- reply.Term
 						}
+						wg.Done()
 					}()
 				}
-				if len(ch) > 0 {
-					tickerLogger.Println("Obsolete leader, convert back to follower")
-					break
+			}
+
+			wg.Wait()
+			close(terms)
+			if len(terms) > 0 {
+				tickerLogger.Println("Obsolete leader, convert back to follower")
+				maxTerm := 0
+				for t := range terms {
+					if t > maxTerm {
+						maxTerm = t
+					}
 				}
+				rf.currentTerm = maxTerm
+				rf.votedFor = -1
+				rf.state = Follower
+				rf.timeout = newTimeout()
 			}
 		}
 	}
