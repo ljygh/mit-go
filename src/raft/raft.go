@@ -296,7 +296,7 @@ func (rf *Raft) ticker() {
 		log.Fatalf("error opening file: %v", err)
 	}
 	defer file.Close()
-	tickerLogger := log.New(file, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags)
+	tickerLogger := log.New(file, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags|log.Lmicroseconds)
 	tickerLogger.Println("Ticker of server", rf.me, "started")
 	tickerLogger.Println("timeout:", rf.timeout)
 	tickerLogger.Println()
@@ -322,24 +322,25 @@ func (rf *Raft) ticker() {
 			inTime := time.Now()
 			var wg sync.WaitGroup
 			var votes int = 1
-			var aliveServers int = 1
+			var votesLock sync.Mutex
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
 					wg.Add(1)
-					go func(votes *int, aliveServers *int) {
+					go func(votes *int) {
 						args := RequestVoteArgs{}
 						args.Term = rf.currentTerm
 						args.CandidateID = rf.me
 						reply := RequestVoteReply{}
 						ok := rf.sendRequestVote(i, &args, &reply)
 						if ok {
-							*aliveServers++
 							if reply.Success {
+								votesLock.Lock()
 								*votes++
+								votesLock.Unlock()
 							}
 						}
 						wg.Done()
-					}(&votes, &aliveServers)
+					}(&votes)
 				}
 			}
 
@@ -353,11 +354,11 @@ func (rf *Raft) ticker() {
 			voteSuccess := false
 			select {
 			case <-done:
-				if votes > (aliveServers / 2) {
+				if votes > (len(rf.peers) / 2) {
 					voteSuccess = true
 				}
-			case <-time.After(100 * time.Millisecond):
-				if votes > (aliveServers / 2) {
+			case <-time.After(2 * time.Millisecond):
+				if votes > (len(rf.peers) / 2) {
 					voteSuccess = true
 				}
 			}
@@ -366,7 +367,7 @@ func (rf *Raft) ticker() {
 
 			// Make decision based on result of votes.
 			tickerLogger.Println("Get number of votes:", votes)
-			tickerLogger.Println("Number of alive servers:", aliveServers)
+			tickerLogger.Println("Number of servers:", len(rf.peers))
 			if voteSuccess {
 				rf.state = Leader
 				rf.timer = 0.1
@@ -378,36 +379,55 @@ func (rf *Raft) ticker() {
 		} else if rf.state == Leader && rf.timer >= heartbeatInterval { // Leader
 			rf.timer = 0.0
 			tickerLogger.Println("Send heartbeat to servers")
-			terms := make(chan int, len(rf.peers)-1)
+			inTime := time.Now()
+			var term int = 0
+			var termLock sync.Mutex
 			var wg sync.WaitGroup
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
 					wg.Add(1)
-					go func() {
+					go func(term *int) {
 						args := AppendEntryArgs{}
 						args.Term = rf.currentTerm
 						args.LeaderID = rf.me
 						reply := AppendEntryReply{}
 						rf.sendAppendEntry(i, &args, &reply)
 						if !reply.Success {
-							terms <- reply.Term
+							termLock.Lock()
+							if reply.Term > *term {
+								*term = reply.Term
+							}
+							termLock.Unlock()
 						}
 						wg.Done()
-					}()
+					}(&term)
 				}
 			}
 
-			wg.Wait()
-			close(terms)
-			if len(terms) > 0 {
-				tickerLogger.Println("Obsolete leader, convert back to follower")
-				maxTerm := 0
-				for t := range terms {
-					if t > maxTerm {
-						maxTerm = t
-					}
+			done := make(chan bool)
+			go func() {
+				defer close(done)
+				wg.Wait()
+				done <- true
+			}()
+
+			isObsolete := false
+			select {
+			case <-done:
+				if term > 0 {
+					isObsolete = true
 				}
-				rf.currentTerm = maxTerm
+			case <-time.After(2 * time.Millisecond):
+				if term > 0 {
+					isObsolete = true
+				}
+			}
+
+			outTime := time.Now()
+			tickerLogger.Println("Finish heartbeat, cost time:", outTime.Sub(inTime))
+			if isObsolete {
+				tickerLogger.Println("Obsolete leader, convert back to follower, term:", term)
+				rf.currentTerm = term
 				rf.votedFor = -1
 				rf.state = Follower
 				rf.timeout = newTimeout()
