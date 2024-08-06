@@ -90,8 +90,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
 	term = rf.currentTerm
 	isleader = (rf.state == Leader)
+	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -166,6 +168,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -178,6 +181,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.timer = 0.0
 		rf.timeout = newTimeout()
 	}
+	rf.mu.Unlock()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -225,6 +229,7 @@ type AppendEntryReply struct {
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+	rf.mu.Lock()
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -239,6 +244,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			rf.state = Follower
 		}
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
@@ -306,8 +312,9 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		tickerLogger.Println("State:", rf.state, ", Term:", rf.currentTerm, ", VotedFor:", rf.votedFor, ", timer:", rf.timer)
 		time.Sleep(time.Millisecond)
+		rf.mu.Lock()
+		tickerLogger.Println("State:", rf.state, ", Term:", rf.currentTerm, ", VotedFor:", rf.votedFor, ", timer:", rf.timer)
 		rf.timer += 0.001
 		if rf.state == Follower && rf.timer >= rf.timeout { // Follower timeout.
 			tickerLogger.Println("Raft server", rf.me, "follower timeout")
@@ -433,6 +440,7 @@ func (rf *Raft) ticker() {
 				rf.timeout = newTimeout()
 			}
 		}
+		rf.mu.Unlock()
 	}
 }
 
