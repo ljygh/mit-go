@@ -65,6 +65,12 @@ const (
 // Define time interval for heart beat.
 const heartbeatInterval float32 = 0.1
 
+// Define Entry for logs
+type Entry struct {
+	Command interface{}
+	Term    int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -76,11 +82,24 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	// 2A
 	currentTerm int
 	votedFor    int
 	timeout     float32
 	timer       float32
 	state       State
+
+	// 2B
+	log         []Entry
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
+
+	// Loggers
+	tickerLogger      *log.Logger
+	requestVoteLogger *log.Logger
+	appendEntryLogger *log.Logger
 }
 
 // return currentTerm and whether this server
@@ -168,6 +187,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.requestVoteLogger.Println("Get vote request.")
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -218,8 +238,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // Rpc args for AppendEntry
 type AppendEntryArgs struct {
+	// 2A
 	Term     int
 	LeaderID int
+
+	// 2B
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Entry
+	LeaderCommit int
 }
 
 // Rpc reply for AppendEntry
@@ -228,25 +255,58 @@ type AppendEntryReply struct {
 	Success bool
 }
 
+// AppendEntry RPC handler
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+	rf.appendEntryLogger.Println("Get append entry request.")
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
+
+	// Old leader.
 	if args.Term < rf.currentTerm {
 		reply.Success = false
-	} else {
+		return
+	}
+
+	// Correct leader, update timer.
+	if rf.currentTerm < args.Term {
+		rf.timeout = newTimeout()
+		rf.currentTerm = args.Term
+	}
+	rf.timer = 0.0
+	if rf.state == Leader {
+		rf.state = Follower
+	}
+
+	// Heartbeat, no entries
+	if len(args.Entries) == 0 {
 		reply.Success = true
-		if rf.currentTerm < args.Term {
-			rf.timeout = newTimeout()
-			rf.currentTerm = args.Term
-		}
-		rf.timer = 0.0
-		if rf.state == Leader {
-			rf.state = Follower
-		}
+		return
+	}
+
+	// Previous entry is not in the log.
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		return
+	}
+
+	// Previous entry is in the log, but terms don't match.
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	// Otherwise, append entries.
+	rf.log = rf.log[:args.PrevLogIndex+1]
+	rf.log = append(rf.log, args.Entries...)
+	reply.Success = true
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 	rf.mu.Unlock()
 }
 
+// Send a AppendEntry RPC to a server.
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
 	return ok
@@ -270,6 +330,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	isLeader = (rf.state == Leader)
+	term = rf.currentTerm
+	if isLeader {
+		newEntry := Entry{}
+		newEntry.Command = command
+		newEntry.Term = term
+		rf.log = append(rf.log, newEntry)
+		index = len(rf.log)
+	}
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -295,17 +366,13 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-func (rf *Raft) ticker() {
-	// Set ticker logger
-	file, err := os.OpenFile("ticker_log_"+strconv.Itoa(rf.me)+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		log.Fatalf("error opening file: %v", err)
-	}
-	defer file.Close()
-	tickerLogger := log.New(file, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags|log.Lmicroseconds)
-	tickerLogger.Println("Ticker of server", rf.me, "started")
-	tickerLogger.Println("timeout:", rf.timeout)
-	tickerLogger.Println()
+func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appendEntryLogFile *os.File) {
+	defer tickerLogFile.Close()
+	defer requestVoteLogFile.Close()
+	defer appendEntryLogFile.Close()
+	rf.tickerLogger.Println("Ticker of server", rf.me, "started")
+	rf.tickerLogger.Println("timeout:", rf.timeout)
+	rf.tickerLogger.Println()
 
 	for !rf.killed() {
 
@@ -314,10 +381,10 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		time.Sleep(time.Millisecond)
 		rf.mu.Lock()
-		tickerLogger.Println("State:", rf.state, ", Term:", rf.currentTerm, ", VotedFor:", rf.votedFor, ", timer:", rf.timer)
+		rf.tickerLogger.Println("State:", rf.state, ", Term:", rf.currentTerm, ", VotedFor:", rf.votedFor, ", timer:", rf.timer)
 		rf.timer += 0.001
 		if rf.state == Follower && rf.timer >= rf.timeout { // Follower timeout.
-			tickerLogger.Println("Raft server", rf.me, "follower timeout")
+			rf.tickerLogger.Println("Raft server", rf.me, "follower timeout")
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			rf.state = Candidate
@@ -325,7 +392,7 @@ func (rf *Raft) ticker() {
 			rf.timeout = newTimeout()
 
 			// Request votes.
-			tickerLogger.Println("Request votes to all servers")
+			rf.tickerLogger.Println("Request votes to all servers")
 			inTime := time.Now()
 			var wg sync.WaitGroup
 			var votes int = 1
@@ -370,25 +437,32 @@ func (rf *Raft) ticker() {
 				}
 			}
 			outTime := time.Now()
-			tickerLogger.Println("Time cost of requesting votes:", outTime.Sub(inTime))
+			rf.tickerLogger.Println("Time cost of requesting votes:", outTime.Sub(inTime))
 
 			// Make decision based on result of votes.
-			tickerLogger.Println("Get number of votes:", votes)
-			tickerLogger.Println("Number of servers:", len(rf.peers))
+			rf.tickerLogger.Println("Get number of votes:", votes)
+			rf.tickerLogger.Println("Number of servers:", len(rf.peers))
 			if voteSuccess {
 				rf.state = Leader
 				rf.timer = 0.1
-				tickerLogger.Println("Become leader")
+				rf.tickerLogger.Println("Become leader")
+
+				// Update nextIndex
+				nextIndex := len(rf.log)
+				for i := 0; i < len(rf.peers); i++ {
+					rf.nextIndex[i] = nextIndex
+				}
 			} else {
 				rf.state = Follower
-				tickerLogger.Println("Lose election, convert back to follower")
+				rf.tickerLogger.Println("Lose election, convert back to follower")
 			}
 		} else if rf.state == Leader && rf.timer >= heartbeatInterval { // Leader
 			rf.timer = 0.0
-			tickerLogger.Println("Send heartbeat to servers")
+			rf.tickerLogger.Println("Send heartbeat to servers")
 			inTime := time.Now()
 			var term int = 0
 			var termLock sync.Mutex
+			var rfLock sync.Mutex
 			var wg sync.WaitGroup
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
@@ -397,14 +471,34 @@ func (rf *Raft) ticker() {
 						args := AppendEntryArgs{}
 						args.Term = rf.currentTerm
 						args.LeaderID = rf.me
+						args.PrevLogIndex = rf.nextIndex[i] - 1
+						if args.PrevLogIndex < 0 {
+							args.PrevLogTerm = -1
+						} else {
+							args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+						}
+						args.Entries = rf.log[rf.nextIndex[i]:]
+						args.LeaderCommit = rf.commitIndex
+
 						reply := AppendEntryReply{}
 						rf.sendAppendEntry(i, &args, &reply)
-						if !reply.Success {
+
+						if reply.Success { // Success: heartbeat or append entries.
+							if len(args.Entries) > 0 {
+								rfLock.Lock()
+								rf.nextIndex[i] = len(rf.log)
+								rfLock.Unlock()
+							}
+						} else if reply.Term > rf.currentTerm { // Obsolete leader.
 							termLock.Lock()
 							if reply.Term > *term {
 								*term = reply.Term
 							}
 							termLock.Unlock()
+						} else { // Fail to append entries.
+							rfLock.Lock()
+							rf.nextIndex[i]--
+							rfLock.Unlock()
 						}
 						wg.Done()
 					}(&term)
@@ -431,9 +525,9 @@ func (rf *Raft) ticker() {
 			}
 
 			outTime := time.Now()
-			tickerLogger.Println("Finish heartbeat, cost time:", outTime.Sub(inTime))
+			rf.tickerLogger.Println("Finish heartbeat, cost time:", outTime.Sub(inTime))
 			if isObsolete {
-				tickerLogger.Println("Obsolete leader, convert back to follower, term:", term)
+				rf.tickerLogger.Println("Obsolete leader, convert back to follower, term:", term)
 				rf.currentTerm = term
 				rf.votedFor = -1
 				rf.state = Follower
@@ -460,19 +554,49 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	// Set ticker logger
+	tickerLogFile, err := os.OpenFile("./log/ticker_log_"+strconv.Itoa(rf.me)+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	rf.tickerLogger = log.New(tickerLogFile, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags|log.Lmicroseconds)
+
+	// Set request vote logger
+	requestVoteLogFile, err := os.OpenFile("./log/requestVote_log_"+strconv.Itoa(rf.me)+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	rf.requestVoteLogger = log.New(requestVoteLogFile, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags|log.Lmicroseconds)
+
+	// Set append entry logger
+	appendEntryLogFile, err := os.OpenFile("./log/appendEntry_log_"+strconv.Itoa(rf.me)+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	rf.appendEntryLogger = log.New(appendEntryLogFile, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags|log.Lmicroseconds)
+
+	// Set append entry logger
+
 	// Your initialization code here (2A, 2B, 2C).
+	// 2A
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.state = Follower
 	rf.timer = 0.0
-
 	rf.timeout = newTimeout()
+
+	// 2B
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex = append(rf.nextIndex, 0)
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.ticker(tickerLogFile, requestVoteLogFile, appendEntryLogFile)
 
 	return rf
 }
