@@ -187,19 +187,23 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.requestVoteLogger.Println("Get vote request.")
 	rf.mu.Lock()
+	rf.requestVoteLogger.Println()
+	rf.requestVoteLogger.Println("Get vote request from server", args.CandidateID)
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		rf.requestVoteLogger.Println("Reject: Term is lower than current term.")
 	} else if args.Term == rf.currentTerm && rf.votedFor != -1 {
 		reply.Success = false
+		rf.requestVoteLogger.Println("Reject: Same term but already voted.")
 	} else {
 		reply.Success = true
 		rf.votedFor = args.CandidateID
 		rf.currentTerm = args.Term
 		rf.timer = 0.0
 		rf.timeout = newTimeout()
+		rf.requestVoteLogger.Println("Vote for server", args.CandidateID)
 	}
 	rf.mu.Unlock()
 }
@@ -257,13 +261,16 @@ type AppendEntryReply struct {
 
 // AppendEntry RPC handler
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	rf.appendEntryLogger.Println("Get append entry request.")
 	rf.mu.Lock()
+	rf.appendEntryLogger.Println()
+	rf.appendEntryLogger.Println("Get append entry request from leader", args.LeaderID)
 	reply.Term = rf.currentTerm
 
 	// Old leader.
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		rf.appendEntryLogger.Println("Reject: Leader of past term.")
+		rf.mu.Unlock()
 		return
 	}
 
@@ -276,22 +283,29 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if rf.state == Leader {
 		rf.state = Follower
 	}
+	rf.appendEntryLogger.Println("Correct heartbeat, reset timer.")
 
 	// Heartbeat, no entries
 	if len(args.Entries) == 0 {
 		reply.Success = true
+		rf.appendEntryLogger.Println("Success, no entries.")
+		rf.mu.Unlock()
 		return
 	}
 
 	// Previous entry is not in the log.
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		rf.appendEntryLogger.Println("Reject: PrevLogIndex not found in log.")
+		rf.mu.Unlock()
 		return
 	}
 
 	// Previous entry is in the log, but terms don't match.
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		rf.appendEntryLogger.Println("Reject: Term not matched in the log.")
+		rf.mu.Unlock()
 		return
 	}
 
@@ -303,6 +317,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
+	rf.appendEntryLogger.Println("Success: Append entries in the log.")
 	rf.mu.Unlock()
 }
 
@@ -449,6 +464,7 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 
 				// Update nextIndex
 				nextIndex := len(rf.log)
+				rf.tickerLogger.Println("Initial nextIndex:", nextIndex)
 				for i := 0; i < len(rf.peers); i++ {
 					rf.nextIndex[i] = nextIndex
 				}
@@ -472,33 +488,37 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 						args.Term = rf.currentTerm
 						args.LeaderID = rf.me
 						args.PrevLogIndex = rf.nextIndex[i] - 1
-						if args.PrevLogIndex < 0 {
-							args.PrevLogTerm = -1
-						} else {
-							args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-						}
+						rf.tickerLogger.Println("Server, nextIndex, PrevLogIndex:", i, rf.nextIndex[i], args.PrevLogIndex)
+						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 						args.Entries = rf.log[rf.nextIndex[i]:]
+						rf.tickerLogger.Println(i, "length of entries:", len(args.Entries))
 						args.LeaderCommit = rf.commitIndex
 
 						reply := AppendEntryReply{}
-						rf.sendAppendEntry(i, &args, &reply)
+						ok := rf.sendAppendEntry(i, &args, &reply)
 
-						if reply.Success { // Success: heartbeat or append entries.
-							if len(args.Entries) > 0 {
+						if ok {
+							if reply.Success { // Success: heartbeat or append entries.
+								if len(args.Entries) > 0 {
+									rfLock.Lock()
+									rf.nextIndex[i] = len(rf.log)
+									rf.tickerLogger.Println(i, "Success, update nextIndex to", rf.nextIndex[i])
+									rfLock.Unlock()
+								}
+								rf.tickerLogger.Println(i, "Success, no entries, nextIndex:", rf.nextIndex[i])
+							} else if reply.Term > rf.currentTerm { // Obsolete leader.
+								termLock.Lock()
+								if reply.Term > *term {
+									*term = reply.Term
+								}
+								termLock.Unlock()
+								rf.tickerLogger.Println(i, "Obsolete leader")
+							} else { // Fail to append entries.
 								rfLock.Lock()
-								rf.nextIndex[i] = len(rf.log)
+								rf.nextIndex[i]--
 								rfLock.Unlock()
+								rf.tickerLogger.Println(i, "Fail, decrease nextIndex to", rf.nextIndex[i])
 							}
-						} else if reply.Term > rf.currentTerm { // Obsolete leader.
-							termLock.Lock()
-							if reply.Term > *term {
-								*term = reply.Term
-							}
-							termLock.Unlock()
-						} else { // Fail to append entries.
-							rfLock.Lock()
-							rf.nextIndex[i]--
-							rfLock.Unlock()
 						}
 						wg.Done()
 					}(&term)
@@ -575,8 +595,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.appendEntryLogger = log.New(appendEntryLogFile, "Raft server "+strconv.Itoa(rf.me), log.LstdFlags|log.Lmicroseconds)
 
-	// Set append entry logger
-
 	// Your initialization code here (2A, 2B, 2C).
 	// 2A
 	rf.currentTerm = 0
@@ -586,11 +604,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.timeout = newTimeout()
 
 	// 2B
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex = append(rf.nextIndex, 0)
+		rf.nextIndex = append(rf.nextIndex, 1)
 	}
+	dummyEntry := Entry{}
+	dummyEntry.Term = 0
+	rf.log = append(rf.log, dummyEntry)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
