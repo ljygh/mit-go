@@ -95,6 +95,7 @@ type Raft struct {
 	lastApplied int
 	nextIndex   []int
 	matchIndex  []int
+	applyCh     chan ApplyMsg
 
 	// Loggers
 	tickerLogger      *log.Logger
@@ -285,6 +286,12 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	rf.appendEntryLogger.Println("Correct heartbeat, reset timer.")
 
+	// Update commitIndex based on the leader.
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.appendEntryLogger.Println("Update commitIndex to:", rf.commitIndex)
+	}
+
 	// Heartbeat, no entries
 	if len(args.Entries) == 0 {
 		reply.Success = true
@@ -313,11 +320,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.log = rf.log[:args.PrevLogIndex+1]
 	rf.log = append(rf.log, args.Entries...)
 	reply.Success = true
-
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-	}
 	rf.appendEntryLogger.Println("Success: Append entries in the log.")
+	rf.printLog(rf.appendEntryLogger)
 	rf.mu.Unlock()
 }
 
@@ -349,12 +353,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = (rf.state == Leader)
 	term = rf.currentTerm
 	if isLeader {
+		index = len(rf.log)
 		newEntry := Entry{}
 		newEntry.Command = command
 		newEntry.Term = term
 		rf.log = append(rf.log, newEntry)
-		index = len(rf.log)
 	}
+	rf.tickerLogger.Println("Get client request, return index, term, isLeader:", index, term, isLeader)
 	rf.mu.Unlock()
 
 	return index, term, isLeader
@@ -462,11 +467,13 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 				rf.timer = 0.1
 				rf.tickerLogger.Println("Become leader")
 
-				// Update nextIndex
+				// Update nextIndex and matchIndex
 				nextIndex := len(rf.log)
 				rf.tickerLogger.Println("Initial nextIndex:", nextIndex)
+				rf.tickerLogger.Println("Initial matchIndex:", rf.commitIndex)
 				for i := 0; i < len(rf.peers); i++ {
 					rf.nextIndex[i] = nextIndex
+					rf.matchIndex[i] = rf.commitIndex
 				}
 			} else {
 				rf.state = Follower
@@ -502,6 +509,7 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 								if len(args.Entries) > 0 {
 									rfLock.Lock()
 									rf.nextIndex[i] = len(rf.log)
+									rf.matchIndex[i] = rf.nextIndex[i] - 1
 									rf.tickerLogger.Println(i, "Success, update nextIndex to", rf.nextIndex[i])
 									rfLock.Unlock()
 								}
@@ -522,6 +530,9 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 						}
 						wg.Done()
 					}(&term)
+				} else {
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = len(rf.log) - 1
 				}
 			}
 
@@ -552,7 +563,32 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 				rf.votedFor = -1
 				rf.state = Follower
 				rf.timeout = newTimeout()
+			} else { // Update commitedIndex.
+				index := rf.commitIndex + 1
+				count := 0
+				for i := 0; i < len(rf.peers); i++ {
+					if rf.matchIndex[i] >= index {
+						count++
+					}
+				}
+
+				if count > len(rf.peers)/2 {
+					rf.commitIndex = index
+					rf.tickerLogger.Println("Leader: set commitIndex to:", rf.commitIndex)
+				}
 			}
+		}
+
+		// Apply command no matter it is leader or follower.
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			applyMsg := ApplyMsg{}
+			applyMsg.CommandValid = true
+			applyMsg.Command = rf.log[rf.lastApplied].Command
+			applyMsg.CommandIndex = rf.lastApplied
+			rf.applyCh <- applyMsg
+			rf.tickerLogger.Println("Apply command with index:", rf.lastApplied)
+			rf.printLog(rf.tickerLogger)
 		}
 		rf.mu.Unlock()
 	}
@@ -608,10 +644,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex = append(rf.nextIndex, 1)
+		rf.matchIndex = append(rf.matchIndex, 0)
 	}
 	dummyEntry := Entry{}
 	dummyEntry.Term = 0
 	rf.log = append(rf.log, dummyEntry)
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -629,4 +667,14 @@ func newTimeout() float32 {
 	const min float32 = 0.4
 	const max float32 = 0.6
 	return min + random.Float32()*(max-min)
+}
+
+// Print info of log.
+func (rf *Raft) printLog(logger *log.Logger) {
+	logger.Print("Logs (index, term, command): ")
+	for i := 1; i < len(rf.log); i++ {
+		logger.Print("(", i, ", ", rf.log[i].Term, ", ", rf.log[i].Command, ")")
+	}
+	logger.Println("Commit index:", rf.commitIndex)
+	logger.Println("Applied index:", rf.lastApplied)
 }
