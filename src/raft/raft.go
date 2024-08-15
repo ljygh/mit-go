@@ -477,6 +477,7 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 				}
 			} else {
 				rf.state = Follower
+				rf.currentTerm--
 				rf.tickerLogger.Println("Lose election, convert back to follower")
 			}
 		} else if rf.state == Leader && rf.timer >= heartbeatInterval { // Leader
