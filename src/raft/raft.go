@@ -173,8 +173,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateID int
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -198,6 +200,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term == rf.currentTerm && rf.votedFor != -1 {
 		reply.Success = false
 		rf.requestVoteLogger.Println("Reject: Same term but already voted.")
+	} else if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+		reply.Success = false
+		rf.requestVoteLogger.Println("Reject: This server holds more up-to-date log according to term.")
+	} else if args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1 {
+		reply.Success = false
+		rf.requestVoteLogger.Println("Reject: This server holds more up-to-date log according to last index.")
 	} else {
 		reply.Success = true
 		rf.votedFor = args.CandidateID
@@ -286,20 +294,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	rf.appendEntryLogger.Println("Correct heartbeat, reset timer.")
 
-	// Update commitIndex based on the leader.
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		rf.appendEntryLogger.Println("Update commitIndex to:", rf.commitIndex)
-	}
-
-	// Heartbeat, no entries
-	if len(args.Entries) == 0 {
-		reply.Success = true
-		rf.appendEntryLogger.Println("Success, no entries.")
-		rf.mu.Unlock()
-		return
-	}
-
 	// Previous entry is not in the log.
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
@@ -320,8 +314,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.log = rf.log[:args.PrevLogIndex+1]
 	rf.log = append(rf.log, args.Entries...)
 	reply.Success = true
-	rf.appendEntryLogger.Println("Success: Append entries in the log.")
+	rf.appendEntryLogger.Println("Success: Append", len(args.Entries), " entries in the log.")
 	rf.printLog(rf.appendEntryLogger)
+
+	// Update commitIndex based on the leader.
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.appendEntryLogger.Println("Update commitIndex to:", rf.commitIndex)
+	}
 	rf.mu.Unlock()
 }
 
@@ -358,8 +358,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		newEntry.Command = command
 		newEntry.Term = term
 		rf.log = append(rf.log, newEntry)
+		rf.tickerLogger.Println("Get new client command:", command)
 	}
-	rf.tickerLogger.Println("Get client request, return index, term, isLeader:", index, term, isLeader)
 	rf.mu.Unlock()
 
 	return index, term, isLeader
@@ -424,6 +424,8 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 						args := RequestVoteArgs{}
 						args.Term = rf.currentTerm
 						args.CandidateID = rf.me
+						args.LastLogIndex = len(rf.log) - 1
+						args.LastLogTerm = rf.log[len(rf.log)-1].Term
 						reply := RequestVoteReply{}
 						ok := rf.sendRequestVote(i, &args, &reply)
 						if ok {
@@ -470,10 +472,10 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 				// Update nextIndex and matchIndex
 				nextIndex := len(rf.log)
 				rf.tickerLogger.Println("Initial nextIndex:", nextIndex)
-				rf.tickerLogger.Println("Initial matchIndex:", rf.commitIndex)
+				rf.tickerLogger.Println("Initial matchIndex:", 0)
 				for i := 0; i < len(rf.peers); i++ {
 					rf.nextIndex[i] = nextIndex
-					rf.matchIndex[i] = rf.commitIndex
+					rf.matchIndex[i] = 0
 				}
 			} else {
 				rf.state = Follower
@@ -513,8 +515,9 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 									rf.matchIndex[i] = rf.nextIndex[i] - 1
 									rf.tickerLogger.Println(i, "Success, update nextIndex to", rf.nextIndex[i])
 									rfLock.Unlock()
+								} else {
+									rf.tickerLogger.Println(i, "Success, no entries, nextIndex:", rf.nextIndex[i])
 								}
-								rf.tickerLogger.Println(i, "Success, no entries, nextIndex:", rf.nextIndex[i])
 							} else if reply.Term > rf.currentTerm { // Obsolete leader.
 								termLock.Lock()
 								if reply.Term > *term {
@@ -578,6 +581,7 @@ func (rf *Raft) ticker(tickerLogFile *os.File, requestVoteLogFile *os.File, appe
 					rf.tickerLogger.Println("Leader: set commitIndex to:", rf.commitIndex)
 				}
 			}
+			rf.printLog(rf.tickerLogger)
 		}
 
 		// Apply command no matter it is leader or follower.
